@@ -30,14 +30,14 @@ errAbort(
 permCount);
 }
 
-// Note: if this becomes > 64k, can't use unsigned short for corr indexes 
-// anymore (use int):
+// Note: if this becomes >= 64k-1 (because we use max+1 as error/extra), 
+// can't use unsigned short for corr indexes anymore (use int):
 #ifndef MAX_GENES_IN_GENOME
-#define MAX_GENES_IN_GENOME (32 * 1024)
+#define MAX_GENES_IN_GENOME ((64 * 1024) - 2)
 #endif
 
 #ifndef MAX_GENES_IN_CLUSTER
-#define MAX_GENES_IN_CLUSTER 32
+#define MAX_GENES_IN_CLUSTER 1024
 #endif
 
 static struct optionSpec options[] = {
@@ -120,7 +120,7 @@ gs->n++;
 }
 
 
-int readCorrFile(struct lineFile *corrLf, char ***retGeneIDs, int maxIDs,
+int readCorrFile(struct lineFile *corrLf, char ***retGeneIDs,
 		 float ***retCorrValues, struct hash **retGeneIDToCix)
 /* Read in gene IDs and 2-D table of floating point gene pair correlation values.
  * Make hash of gene IDs to correlation table indexes (cix). */
@@ -131,16 +131,17 @@ char *line;
 if (! lineFileNext(corrLf, &line, &lineSize))
     lineFileAbort(corrLf, "Failed to read first line");
 char *geneIDStr = cloneStringZ(line, lineSize);
+stripChar(geneIDStr, '"');
 char **geneIDs;
-AllocArray(geneIDs, maxIDs+1);
-int geneCount = chopByWhite(geneIDStr, geneIDs, maxIDs+1);
-if (geneCount > maxIDs)
-    errAbort("Recompile with larger MAX_GENES_IN_GENOME (%d)", maxIDs);
+AllocArray(geneIDs, MAX_GENES_IN_GENOME+1);
+int geneCount = chopByWhite(geneIDStr, geneIDs, MAX_GENES_IN_GENOME+1);
+if (geneCount > MAX_GENES_IN_GENOME)
+    errAbort("Recompile with larger MAX_GENES_IN_GENOME (%d)", MAX_GENES_IN_GENOME);
 verbose(1, "Got %d gene IDs\n", geneCount);
 
 // Subsequent lines contain geneID followed by geneCount floating point values. 
 // Store in 2-D array (geneCount x geneCount):
-struct hash *geneIDToCix = hashNew((int)(log(maxIDs) / log(2) + 1.5));
+struct hash *geneIDToCix = hashNew((int)(log(MAX_GENES_IN_GENOME) / log(2) + 1.5));
 char *words[MAX_GENES_IN_GENOME+1];
 int wordCount;
 float **corrValues;
@@ -150,6 +151,7 @@ while ((wordCount = lineFileChop(corrLf, words)) > 0)
     {
     if (wordCount != geneCount+1)
 	lineFileAbort(corrLf, "Expected geneCount+1=%d words, got %d", geneCount+1, wordCount);
+    stripChar(words[0], '"');
     hashAddInt(geneIDToCix, geneIDs[geneCix], geneCix);
     AllocArray(corrValues[geneCix], geneCount);
     if (! sameString(words[0], geneIDs[geneCix]))
@@ -182,8 +184,10 @@ char *words[4];
 while ((wordCount = lineFileChop(geneLf, words)) > 0)
     {
     lineFileExpectWords(geneLf, 3, wordCount);
-    unsigned short cix = (unsigned short)hashIntValDefault(geneIDToCix, words[0], -1);
-    if (cix < 0)
+    stripChar(words[0], '"');
+    unsigned short cix = (unsigned short)hashIntValDefault(geneIDToCix, words[0],
+							   MAX_GENES_IN_GENOME+1);
+    if (cix == MAX_GENES_IN_GENOME+1)
 	lineFileAbort(geneLf, "genes ID %s not found in corr file", words[0]);
     unsigned int start = sqlUnsigned(words[2]);
     geneSetAdd(genesInGenome, cix, start);
@@ -243,23 +247,18 @@ while (startI < gs->n)
 }
 
 struct clustersANCs *getDistros(float **corrValues, struct geneSet *genesOnChrom, 
-			       int minBlkSize, int maxBlkSize, int *retTotalClusterCount)
+			       int minBlkSize, int maxBlkSize)
 /* For each window size, compute clusters of genes and their average neighborhood 
  * correlations (ANCs). */
 {
 int winCount = ((maxBlkSize - minBlkSize) / minBlkSize) + 1;
 struct clustersANCs *dist;
 AllocArray(dist, winCount);
-int totalClusterCount = 0;
 int win, winSize;
 for (win = 0, winSize = minBlkSize;  winSize <= maxBlkSize;  win++, winSize += minBlkSize)
-    {
     clusterOneWinSize(winSize, corrValues, genesOnChrom, &(dist[win]));
-    totalClusterCount += dist[win].n;
-    }
 if (win != winCount)
     errAbort("arithmetic error: expected %d windows, got %d", winCount, win);
-*retTotalClusterCount = totalClusterCount;
 return dist;
 }
 
@@ -298,42 +297,52 @@ if (fa > fb)
 return 0;
 }
 
-float *getRandomANCs(float **corrValues, int geneCount, struct clustersANCs *realDistros,
-		     int winCount, int totalClusterCount, int permCount)
+float **getRandomANCs(float **corrValues, int geneCount, struct clustersANCs *realDistros,
+		      int winCount, int permCount)
 /* For permCount iterations, shuffle the IDs of genesInGenome and use realDistros'
- * clusters to compute ANCs using the shuffled IDs for all window sizes, for all clusters.
- * Return a sorted array of (totalClusterCount * permCount) of these null-model ANCs,
- * for p-value computation. */
+ * clusters to compute ANCs using the shuffled IDs for all clusters in each window size.
+ * Return a 2-D array of per-window-size null-model ANCs, [win][dist->n], for
+ * per-window-size p-value computation. */
 {
-float *randANCs;
-int totalANCs = (totalClusterCount * permCount);
-AllocArray(randANCs, totalANCs);
+float **randANCs;
+AllocArray(randANCs, winCount);
 unsigned short mappedCixs[MAX_GENES_IN_CLUSTER];
-int p, ra, win;
-for (ra = 0, p = 0;  p < permCount;  p++)
+int p, win;
+for (p = 0;  p < permCount;  p++)
     {
     int *shuffleMap = makeShuffleMap(geneCount);
     for (win = 0;  win < winCount;  win++)
 	{
-	struct clustersANCs *curDist = &(realDistros[win]);
-	int c;
-	for (c = 0;  c < curDist->n;  c++)
+	float *randANCsInWin = randANCs[win];
+	struct clustersANCs *winDist = &(realDistros[win]);
+	if (p == 0)
 	    {
-	    struct geneSet *cl = curDist->clusters[c];
+	    AllocArray(randANCsInWin, (permCount * winDist->n));
+	    randANCs[win] = randANCsInWin;
+	    }
+	int permOffset = (p * winDist->n);
+	int c;
+	for (c = 0;  c < winDist->n;  c++)
+	    {
+	    struct geneSet *cl = winDist->clusters[c];
+	    if (cl->n > MAX_GENES_IN_CLUSTER)
+		errAbort("Recompile with MAX_GENES_IN_CLUSTER > %d", MAX_GENES_IN_CLUSTER);
 	    int i;
 	    for (i = 0;  i < cl->n; i++)
 		{
 		unsigned short realCix = cl->cixs[i];
 		mappedCixs[i] = shuffleMap[realCix];
 		}
-	    randANCs[ra++] = calcANC(corrValues, mappedCixs, cl->n);
+	    randANCsInWin[permOffset + c] = calcANC(corrValues, mappedCixs, cl->n);
 	    }
+	randANCs[win] = randANCsInWin;
 	}
     }
-if (ra != totalANCs)
-    errAbort("Expected %d * %d = %d total randomized ANCs, but got %d",
-	     totalClusterCount, permCount, totalANCs, ra);
-qsort(randANCs, totalANCs, sizeof(*randANCs), cmpFloatP);
+for (win = 0;  win < winCount;  win++)
+    {
+    struct clustersANCs *winDist = &(realDistros[win]);
+    qsort(randANCs[win], (permCount * winDist->n), sizeof(*randANCs[win]), cmpFloatP);
+    }
 return randANCs;
 }
 
@@ -360,7 +369,7 @@ if (cmpScores[rightI] <= score)
 return (cmpScoresCount - rightI);
 }
 
-void makePValues(FILE *pvalOutF, struct clustersANCs *realDistros, float *randANCs, int totalANCs,
+void makePValues(FILE *pvalOutF, struct clustersANCs *realDistros, float **randANCs, int permCount,
 		 char **geneIDs, int minBlkSize, int maxBlkSize)
 /* Print out cluster ANCs, genes and those ANC's p-values (e.g. the proportion
  * of cluster ANCs derived from shuffled correlation values that are greater) */
@@ -370,12 +379,13 @@ int win, winSize;
 for (win = 0, winSize = minBlkSize;  winSize <= maxBlkSize;  win++, winSize += minBlkSize)
     {
     struct clustersANCs *curDist = &(realDistros[win]);
+    int totalANCs = curDist->n * permCount;
     int c, i;
     for (c = 0;  c < curDist->n;  c++)
 	{
 	struct geneSet *gs = curDist->clusters[c];
 	float anc = curDist->ancs[c];
-	float pvalue = (float)findGreaters(anc, randANCs, totalANCs) / (float)totalANCs;
+	float pvalue = (float)findGreaters(anc, randANCs[win], totalANCs) / (float)totalANCs;
 	int windex = gs->starts[0] / minBlkSize;
 	fprintf(pvalOutF, "%d \t %d \t %f \t %f \t", winSize, windex, anc, pvalue);
 	for (i = 0;  i < gs->n;  i++)
@@ -396,7 +406,7 @@ struct lineFile *corrLf = lineFileOpen(corrFile, TRUE);
 struct lineFile *geneLf = lineFileOpen(geneStartFile, TRUE);
 makeDirsOnPath(resultDir);
 char pvalOutFile[2048];
-safef(pvalOutFile, sizeof(pvalOutFile), "%s/nhood_pvalues_c_bpair_CHR%s_MIN%d_MAX%d.txt",
+safef(pvalOutFile, sizeof(pvalOutFile), "%s/nhood_pvalues_bpair_c_CHR%s_MIN%d_MAX%d.txt",
       resultDir, chrNum, minBlkSize, maxBlkSize);
 FILE *pvalOutF = mustOpen(pvalOutFile, "w");
 
@@ -405,7 +415,7 @@ FILE *pvalOutF = mustOpen(pvalOutFile, "w");
 char **geneIDs;
 float **corrValues;
 struct hash *geneIDToCix = NULL;
-int geneCount = readCorrFile(corrLf, &geneIDs, MAX_GENES_IN_GENOME, &corrValues, &geneIDToCix);
+int geneCount = readCorrFile(corrLf, &geneIDs, &corrValues, &geneIDToCix);
 lineFileClose(&corrLf);
 (void)system("date");
 
@@ -418,21 +428,17 @@ if (genesOnChrom->n == 0)
     errAbort("%s contains no genes for %s", geneStartFile, chrNum);
 
 // Compute gene clusters and real ANCs.
-int totalClusterCount;
-struct clustersANCs *realDistros = getDistros(corrValues, genesOnChrom, minBlkSize, maxBlkSize,
-					     &totalClusterCount);
+struct clustersANCs *realDistros = getDistros(corrValues, genesOnChrom, minBlkSize, maxBlkSize);
 
 // Make the specified number of permutations of pairwise correlation values,
-// and use those to calculate ANCs on all clusters, to get a null model 
-// distribution.
+// and use those to calculate ANCs on all clusters, to get per-window-size null model 
+// distributions.
 int winCount = ((maxBlkSize - minBlkSize) / minBlkSize) + 1;
-float *randANCs = getRandomANCs(corrValues, geneCount, realDistros,
-				winCount, totalClusterCount, permCount);
+float **randANCs = getRandomANCs(corrValues, geneCount, realDistros, winCount, permCount);
 
-// Use the null model to estimate p-values for all clusters' ANCs, and write 
+// Use the per-win null models to estimate p-values for all clusters' ANCs, and write 
 // out clusters, ANCs and p-values.
-makePValues(pvalOutF, realDistros, randANCs, (totalClusterCount * permCount),
-	    geneIDs, minBlkSize, maxBlkSize);
+makePValues(pvalOutF, realDistros, randANCs, permCount, geneIDs, minBlkSize, maxBlkSize);
 carefulClose(&pvalOutF);
 (void)system("date");
 }
